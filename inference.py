@@ -7,11 +7,19 @@ from glob import glob
 import torch, face_detection
 from models import Wav2Lip
 import platform
+from face_parsing import init_parser, swap_regions
+from basicsr.apply_sr import init_sr_model, enhance
 
 parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
 
 parser.add_argument('--checkpoint_path', type=str, 
 					help='Name of saved checkpoint to load weights from', required=True)
+
+parser.add_argument('--segmentation_path', type=str, 
+					help='Name of saved checkpoint of segmentation network', required=True)
+
+parser.add_argument('--sr_path', type=str, 
+					help='Name of saved checkpoint of super-resolution network', required=True)
 
 parser.add_argument('--face', type=str, 
 					help='Filepath of video/image that contains faces to use', required=True)
@@ -19,6 +27,7 @@ parser.add_argument('--audio', type=str,
 					help='Filepath of video/audio file to use as raw audio source', required=True)
 parser.add_argument('--outfile', type=str, help='Video path to save result. See default for an e.g.', 
 								default='results/result_voice.mp4')
+
 
 parser.add_argument('--static', type=bool, 
 					help='If True, then use only first video frame for inference', default=False)
@@ -49,6 +58,21 @@ parser.add_argument('--rotate', default=False, action='store_true',
 
 parser.add_argument('--nosmooth', default=False, action='store_true',
 					help='Prevent smoothing face detections over a short temporal window')
+parser.add_argument('--no_segmentation', default=False, action='store_true',
+					help='Prevent using face segmentation')
+parser.add_argument('--no_sr', default=False, action='store_true',
+					help='Prevent using super resolution')
+
+parser.add_argument('--save_frames', default=False, action='store_true',
+					help='Save each frame as an image. Use with caution')
+parser.add_argument('--gt_path', type=str, 
+					help='Where to store saved ground truth frames', required=False)
+parser.add_argument('--pred_path', type=str, 
+					help='Where to store frames produced by algorithm', required=False)
+parser.add_argument('--save_as_video', action="store_true", default=False,
+					help='Whether to save frames as video', required=False)
+parser.add_argument('--image_prefix', type=str, default="",
+					help='Prefix to save frames with', required=False)
 
 args = parser.parse_args()
 args.img_size = 96
@@ -74,7 +98,7 @@ def face_detect(images):
 	while 1:
 		predictions = []
 		try:
-			for i in tqdm(range(0, len(images), batch_size)):
+			for i in range(0, len(images), batch_size):
 				predictions.extend(detector.get_detections_for_batch(np.array(images[i:i + batch_size])))
 		except RuntimeError:
 			if batch_size == 1: 
@@ -105,9 +129,10 @@ def face_detect(images):
 	del detector
 	return results 
 
-def datagen(frames, mels):
+def datagen(mels):
 	img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
 
+	"""
 	if args.box[0] == -1:
 		if not args.static:
 			face_det_results = face_detect(frames) # BGR2RGB for CNN face detection
@@ -117,11 +142,18 @@ def datagen(frames, mels):
 		print('Using the specified bounding box instead of face detection...')
 		y1, y2, x1, x2 = args.box
 		face_det_results = [[f[y1: y2, x1:x2], (y1, y2, x1, x2)] for f in frames]
+	"""
+
+	reader = read_frames()
 
 	for i, m in enumerate(mels):
-		idx = 0 if args.static else i%len(frames)
-		frame_to_save = frames[idx].copy()
-		face, coords = face_det_results[idx].copy()
+		try:
+			frame_to_save = next(reader)
+		except StopIteration:
+			reader = read_frames()
+			frame_to_save = next(reader)
+
+		face, coords = face_detect([frame_to_save])[0]
 
 		face = cv2.resize(face, (args.img_size, args.img_size))
 			
@@ -178,41 +210,47 @@ def load_model(path):
 	model = model.to(device)
 	return model.eval()
 
+def read_frames():
+	if args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
+		face = cv2.imread(args.face)
+		while 1:
+			yield face
+
+	video_stream = cv2.VideoCapture(args.face)
+	fps = video_stream.get(cv2.CAP_PROP_FPS)
+
+	print('Reading video frames from start...')
+
+	while 1:
+		still_reading, frame = video_stream.read()
+		if not still_reading:
+			video_stream.release()
+			break
+		if args.resize_factor > 1:
+			frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
+
+		if args.rotate:
+			frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
+
+		y1, y2, x1, x2 = args.crop
+		if x2 == -1: x2 = frame.shape[1]
+		if y2 == -1: y2 = frame.shape[0]
+
+		frame = frame[y1:y2, x1:x2]
+
+		yield frame
+
 def main():
 	if not os.path.isfile(args.face):
 		raise ValueError('--face argument must be a valid path to video/image file')
 
 	elif args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
-		full_frames = [cv2.imread(args.face)]
 		fps = args.fps
-
 	else:
 		video_stream = cv2.VideoCapture(args.face)
 		fps = video_stream.get(cv2.CAP_PROP_FPS)
+		video_stream.release()
 
-		print('Reading video frames...')
-
-		full_frames = []
-		while 1:
-			still_reading, frame = video_stream.read()
-			if not still_reading:
-				video_stream.release()
-				break
-			if args.resize_factor > 1:
-				frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
-
-			if args.rotate:
-				frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
-
-			y1, y2, x1, x2 = args.crop
-			if x2 == -1: x2 = frame.shape[1]
-			if y2 == -1: y2 = frame.shape[0]
-
-			frame = frame[y1:y2, x1:x2]
-
-			full_frames.append(frame)
-
-	print ("Number of frames available for inference: "+str(len(full_frames)))
 
 	if not args.audio.endswith('.wav'):
 		print('Extracting raw audio...')
@@ -241,18 +279,29 @@ def main():
 
 	print("Length of mel chunks: {}".format(len(mel_chunks)))
 
-	full_frames = full_frames[:len(mel_chunks)]
-
 	batch_size = args.wav2lip_batch_size
-	gen = datagen(full_frames.copy(), mel_chunks)
+	gen = datagen(mel_chunks)
 
+
+
+	if args.save_as_video:
+		gt_out = cv2.VideoWriter("temp/gt.avi", cv2.VideoWriter_fourcc(*'DIVX'), fps, (384, 384))
+		pred_out = cv2.VideoWriter("temp/pred.avi", cv2.VideoWriter_fourcc(*'DIVX'), fps, (96, 96))
+
+	abs_idx = 0
 	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
 											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
 		if i == 0:
+			print("Loading segmentation network...")
+			seg_net = init_parser(args.segmentation_path)
+
+			print("Loading super resolution model...")
+			sr_net = init_sr_model(args.sr_path)
+
 			model = load_model(args.checkpoint_path)
 			print ("Model loaded")
 
-			frame_h, frame_w = full_frames[0].shape[:-1]
+			frame_h, frame_w = next(read_frames()).shape[:-1]
 			out = cv2.VideoWriter('temp/result.avi', 
 									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
 
@@ -266,7 +315,22 @@ def main():
 		
 		for p, f, c in zip(pred, frames, coords):
 			y1, y2, x1, x2 = c
+
+			if args.save_frames:
+				if args.save_as_video:
+					pred_out.write(p.astype(np.uint8))
+					gt_out.write(cv2.resize(f[y1:y2, x1:x2], (384, 384)))
+				else:
+					cv2.imwrite(f"{args.gt_path}/{args.image_prefix}{abs_idx}.png", f[y1:y2, x1:x2])
+					cv2.imwrite(f"{args.pred_path}/{args.image_prefix}{abs_idx}.png", p)
+					abs_idx += 1
+
+			if not args.no_sr:
+				p = enhance(sr_net, p)
 			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+			
+			if not args.no_segmentation:
+				p = swap_regions(f[y1:y2, x1:x2], p, seg_net)
 
 			f[y1:y2, x1:x2] = p
 			out.write(f)
@@ -275,6 +339,17 @@ def main():
 
 	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
 	subprocess.call(command, shell=platform.system() != 'Windows')
+
+	if args.save_frames and args.save_as_video:
+		gt_out.release()
+		pred_out.release()
+
+		command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/gt.avi', args.gt_path)
+		subprocess.call(command, shell=platform.system() != 'Windows')
+
+		command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/pred.avi', args.pred_path)
+		subprocess.call(command, shell=platform.system() != 'Windows')
+
 
 if __name__ == '__main__':
 	main()
